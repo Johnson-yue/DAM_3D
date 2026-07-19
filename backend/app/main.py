@@ -14,6 +14,7 @@ from .db import init_db
 from .routers import assets, search, settings as settings_router
 from .services.embedding import load_siglip
 from .services.faiss_index import get_faiss_index
+from .services.search_debug import cleanup_debug_vectors
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("dam")
@@ -27,6 +28,13 @@ async def lifespan(app: FastAPI):
     # 尝试加载模型；失败不阻断启动
     load_siglip(settings.siglip_path)
     get_faiss_index()
+    # 启动时清掉上次异常退出残留的 Debug 噪声向量
+    try:
+        cleaned = cleanup_debug_vectors()
+        if cleaned.get("removed"):
+            logger.info("cleared leftover debug vectors: %s", cleaned.get("removed"))
+    except Exception:
+        logger.exception("debug vector cleanup on startup failed")
     yield
 
 

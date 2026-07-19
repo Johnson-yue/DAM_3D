@@ -1,6 +1,7 @@
 """检索：视图级 faiss → 按资产 Max 聚合 → 可选标签加权。"""
 from __future__ import annotations
 
+import time
 from pathlib import Path
 
 import numpy as np
@@ -124,10 +125,16 @@ def search_by_vector(
 
 
 def search_text(db: Session, query: str) -> SearchResponse:
+    t0 = time.perf_counter()
     vec = embed_text(query)
-    return search_by_vector(db, vec, text_for_tags=query, apply_tag_boost=True)
+    resp = search_by_vector(db, vec, text_for_tags=query, apply_tag_boost=True)
+    resp.elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    return resp
 
 
 def search_image(db: Session, image: Image.Image) -> SearchResponse:
+    t0 = time.perf_counter()
     vec = embed_pil(image)
-    return search_by_vector(db, vec, apply_tag_boost=False)
+    resp = search_by_vector(db, vec, apply_tag_boost=False)
+    resp.elapsed_ms = round((time.perf_counter() - t0) * 1000.0, 3)
+    return resp

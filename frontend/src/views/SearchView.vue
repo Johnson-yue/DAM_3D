@@ -8,8 +8,39 @@
           以图搜图
           <input type="file" accept="image/*" @change="searchImage" />
         </label>
+        <label class="debug-toggle">
+          <input type="checkbox" :checked="debugEnabled" :disabled="debugBusy" @change="onDebugToggle" />
+          Debug
+        </label>
       </div>
       <p class="hint">Top-1 最大化展示；其余按相似度列在下方。默认 Top-K 可在设置修改。</p>
+
+      <div v-if="debugEnabled" class="debug-panel">
+        <div class="row">
+          <label>
+            N 噪声向量
+            <input v-model.number="debugN" type="number" min="1" max="5000" />
+          </label>
+          <label>
+            M 探针数
+            <input v-model.number="debugM" type="number" min="1" max="500" />
+          </label>
+          <button class="secondary" :disabled="debugBusy" @click="applyNoiseN">应用 N</button>
+          <button :disabled="debugBusy || busy" @click="runBenchmark">跑基准</button>
+        </div>
+        <p class="debug-metrics">
+          索引 {{ debugStatus.ntotal ?? '-' }} 条 · 噪声 {{ debugStatus.n ?? 0 }} · dim {{ debugStatus.dim ?? '-' }}
+          <span v-if="lastElapsed != null"> · 最近检索 {{ lastElapsed }} ms</span>
+        </p>
+        <p v-if="benchmark" class="debug-metrics">
+          基准：probed {{ benchmark.probed }} · hit@{{ benchmark.k }} =
+          {{ (benchmark.hit_at_k * 100).toFixed(1) }}%
+          · 均值 {{ benchmark.elapsed_ms_mean }} ms
+          · 中位 {{ benchmark.elapsed_ms_median }} ms
+          · min/max {{ benchmark.elapsed_ms_min }}/{{ benchmark.elapsed_ms_max }} ms
+        </p>
+      </div>
+
       <p v-if="err" class="err">{{ err }}</p>
     </section>
 
@@ -43,7 +74,7 @@
 </template>
 
 <script setup>
-import { ref } from 'vue'
+import { onMounted, ref } from 'vue'
 import { api } from '../api'
 
 const q = ref('')
@@ -51,6 +82,90 @@ const busy = ref(false)
 const err = ref('')
 const top1 = ref(null)
 const others = ref([])
+const lastElapsed = ref(null)
+
+const debugEnabled = ref(false)
+const debugBusy = ref(false)
+const debugN = ref(100)
+const debugM = ref(20)
+const debugStatus = ref({})
+const benchmark = ref(null)
+
+async function refreshDebugStatus() {
+  debugStatus.value = await api('/api/search/debug/status')
+  debugEnabled.value = !!debugStatus.value.enabled
+  if (!debugN.value) debugN.value = debugStatus.value.default_n || 100
+  if (!debugM.value) debugM.value = debugStatus.value.default_m || 20
+}
+
+async function onDebugToggle(ev) {
+  const want = ev.target.checked
+  debugBusy.value = true
+  err.value = ''
+  try {
+    if (want) {
+      const n = Math.min(5000, Math.max(1, Number(debugN.value) || 100))
+      debugN.value = n
+      debugStatus.value = await api('/api/search/debug/enable', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ n }),
+      })
+      debugEnabled.value = true
+      benchmark.value = null
+    } else {
+      debugStatus.value = await api('/api/search/debug/disable', { method: 'POST' })
+      debugEnabled.value = false
+      benchmark.value = null
+    }
+    await refreshDebugStatus()
+  } catch (e) {
+    err.value = String(e.message || e)
+    ev.target.checked = debugEnabled.value
+  } finally {
+    debugBusy.value = false
+  }
+}
+
+async function applyNoiseN() {
+  if (!debugEnabled.value) return
+  debugBusy.value = true
+  err.value = ''
+  try {
+    const n = Math.min(5000, Math.max(1, Number(debugN.value) || 100))
+    debugN.value = n
+    debugStatus.value = await api('/api/search/debug/enable', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ n }),
+    })
+    benchmark.value = null
+    await refreshDebugStatus()
+  } catch (e) {
+    err.value = String(e.message || e)
+  } finally {
+    debugBusy.value = false
+  }
+}
+
+async function runBenchmark() {
+  debugBusy.value = true
+  err.value = ''
+  try {
+    const m = Math.max(1, Number(debugM.value) || 20)
+    debugM.value = m
+    benchmark.value = await api('/api/search/debug/benchmark', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ m }),
+    })
+    await refreshDebugStatus()
+  } catch (e) {
+    err.value = String(e.message || e)
+  } finally {
+    debugBusy.value = false
+  }
+}
 
 async function searchText() {
   if (!q.value.trim()) return
@@ -62,6 +177,7 @@ async function searchText() {
     const data = await api('/api/search/text', { method: 'POST', body: fd })
     top1.value = data.top1
     others.value = data.others || []
+    lastElapsed.value = data.elapsed_ms ?? null
     if (!data.top1) err.value = '无结果（可能 Embedding/索引尚未就绪）'
   } catch (e) {
     err.value = String(e.message || e)
@@ -81,6 +197,7 @@ async function searchImage(ev) {
     const data = await api('/api/search/image', { method: 'POST', body: fd })
     top1.value = data.top1
     others.value = data.others || []
+    lastElapsed.value = data.elapsed_ms ?? null
   } catch (e) {
     err.value = String(e.message || e)
   } finally {
@@ -88,12 +205,41 @@ async function searchImage(ev) {
     ev.target.value = ''
   }
 }
+
+onMounted(async () => {
+  try {
+    await refreshDebugStatus()
+  } catch {
+    /* ignore */
+  }
+})
 </script>
 
 <style scoped>
 .search-box { margin-bottom: 1rem; }
 .row { display: flex; gap: 0.75rem; flex-wrap: wrap; align-items: end; }
 .row input { min-width: 280px; flex: 1; }
+.debug-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  color: var(--muted);
+  font-size: 0.9rem;
+  user-select: none;
+}
+.debug-panel {
+  margin-top: 0.75rem;
+  padding-top: 0.75rem;
+  border-top: 1px solid var(--border);
+}
+.debug-panel input[type='number'] {
+  width: 100px;
+  min-width: 100px;
+  flex: 0;
+  display: block;
+  margin-top: 0.25rem;
+}
+.debug-metrics { color: var(--muted); font-size: 0.85rem; margin: 0.35rem 0 0; }
 .hint { color: var(--muted); }
 .err { color: var(--err); }
 .hero { margin-bottom: 1rem; }

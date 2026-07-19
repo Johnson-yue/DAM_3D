@@ -14,6 +14,8 @@ from ..schemas import (
     AnnotationOut,
     AnnotationsReplace,
     AssetOut,
+    BulkDeleteRequest,
+    BulkDeleteResponse,
     ScanRequest,
     TagOut,
     TagsUpdate,
@@ -21,7 +23,7 @@ from ..schemas import (
 )
 from ..services.ingest import copy_into_library, scan_directory
 from ..services.faiss_index import get_faiss_index
-from ..services.preprocess import enqueue_preprocess, process_asset
+from ..services.preprocess import enqueue_preprocess
 from ..services.tagging import auto_tag_asset
 
 router = APIRouter(prefix="/api/assets", tags=["assets"])
@@ -64,6 +66,31 @@ def list_assets(db: Session = Depends(get_db)) -> list[AssetOut]:
     return [serialize_asset(a) for a in rows]
 
 
+@router.post("/bulk-delete", response_model=BulkDeleteResponse)
+def bulk_delete_assets(body: BulkDeleteRequest, db: Session = Depends(get_db)) -> BulkDeleteResponse:
+    """批量硬删除；逐个复用单删清理路径，汇总成功/失败 id。"""
+    deleted: list[int] = []
+    failed: list[dict] = []
+    # 去重并保持顺序
+    seen: set[int] = set()
+    ids: list[int] = []
+    for raw in body.ids:
+        aid = int(raw)
+        if aid in seen:
+            continue
+        seen.add(aid)
+        ids.append(aid)
+    for aid in ids:
+        try:
+            _hard_delete_asset(db, aid)
+            deleted.append(aid)
+        except HTTPException as e:
+            failed.append({"id": aid, "error": e.detail})
+        except Exception as e:
+            failed.append({"id": aid, "error": str(e)})
+    return BulkDeleteResponse(ok=len(failed) == 0, deleted=deleted, failed=failed)
+
+
 @router.get("/{asset_id}")
 def get_asset(asset_id: int, db: Session = Depends(get_db)) -> AssetOut:
     a = (
@@ -80,6 +107,10 @@ def get_asset(asset_id: int, db: Session = Depends(get_db)) -> AssetOut:
 @router.delete("/{asset_id}")
 def delete_asset(asset_id: int, db: Session = Depends(get_db)) -> dict:
     """删除资产记录、向量以及托管库内原件/衍生品。"""
+    return _hard_delete_asset(db, asset_id)
+
+
+def _hard_delete_asset(db: Session, asset_id: int) -> dict:
     a = db.get(Asset, asset_id)
     if not a:
         raise HTTPException(404, "asset not found")
@@ -147,17 +178,9 @@ def scan_assets(body: ScanRequest, db: Session = Depends(get_db)) -> list[AssetO
     return [serialize_asset(a) for a in rows]
 
 
-@router.post("/{asset_id}/reprocess")
-def reprocess(asset_id: int, db: Session = Depends(get_db)) -> AssetOut:
-    a = db.get(Asset, asset_id)
-    if not a:
-        raise HTTPException(404)
-    enqueue_preprocess(asset_id)
-    return serialize_asset(a)
-
-
 @router.put("/{asset_id}/tags")
 def update_tags(asset_id: int, body: TagsUpdate, db: Session = Depends(get_db)) -> AssetOut:
+    """全量替换资产标签并写回 SQLite；用于卡片/详情中的修改与删除。"""
     a = (
         db.query(Asset)
         .options(joinedload(Asset.tags), joinedload(Asset.views))
@@ -166,15 +189,16 @@ def update_tags(asset_id: int, body: TagsUpdate, db: Session = Depends(get_db)) 
     )
     if not a:
         raise HTTPException(404)
-    db.query(Tag).filter(Tag.asset_id == asset_id, Tag.source == "user").delete()
-    for t in body.tags:
-        t = t.strip()
-        if t:
+    # 入库后标签以手动维护为准：每次 PUT 全量覆盖，保证修改/删除立即持久化。
+    db.query(Tag).filter(Tag.asset_id == asset_id).delete()
+    cleaned: list[str] = []
+    for raw in body.tags:
+        t = raw.strip()
+        if t and t not in cleaned:
+            cleaned.append(t)
             db.add(Tag(asset_id=asset_id, tag=t, source="user"))
-    if body.tags:
-        a.tag_status = "manual" if a.tag_status != "auto" else a.tag_status
+    a.tag_status = "manual" if cleaned else "none"
     db.commit()
-    db.refresh(a)
     a = (
         db.query(Asset)
         .options(joinedload(Asset.tags), joinedload(Asset.views))

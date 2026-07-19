@@ -98,6 +98,25 @@ class SearchResponse(BaseModel):
     top1: Optional[SearchHit] = None
     others: list[SearchHit] = []
     k: int
+    elapsed_ms: Optional[float] = None
+
+
+class BulkDeleteRequest(BaseModel):
+    ids: list[int]
+
+
+class BulkDeleteResponse(BaseModel):
+    ok: bool
+    deleted: list[int] = []
+    failed: list[dict] = []
+
+
+class DebugEnableRequest(BaseModel):
+    n: int = 100
+
+
+class DebugBenchmarkRequest(BaseModel):
+    m: int = 20
 
 
 class AnnotationIn(BaseModel):
